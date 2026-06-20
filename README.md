@@ -1,6 +1,12 @@
 # Document-QA-Bot
 
-Document-QA-Bot is a starter project that demonstrates how to build a simple Document Question Answering (RAG) system using Python, Google Gemini (Generative AI), and ChromaDB for embeddings and vector search. This repository includes a minimal ingestion pipeline, a query interface, and a Streamlit demo app.
+Document-QA-Bot is a beginner-friendly RAG (Retrieval-Augmented Generation) starter project using Python, Google Gemini (Generative AI), and ChromaDB for embeddings and vector search. It provides:
+
+- Document ingestion from PDF/DOCX/TXT
+- Chunking with overlap and deduplication
+- Embedding generation (Gemini)
+- Persistent vector store using ChromaDB
+- A Streamlit demo app for asking questions and viewing sources
 
 Project structure
 
@@ -40,6 +46,9 @@ Getting started (Windows)
 
 	- `GOOGLE_API_KEY` — your Google Generative AI / Gemini API key
 	- `CHROMA_DIR` — directory where ChromaDB will persist its database (default: `db/chroma`)
+	- `CHROMA_COLLECTION` — Chroma collection name (default: `document_knowledge_base`)
+	- `CHUNK_SIZE` and `CHUNK_OVERLAP` — control chunking (defaults: 1000, 200)
+	- `MAX_DISTANCE` — numeric threshold used to filter search results by distance (defaults: 0.5)
 
 5. Run the demo app:
 
@@ -49,11 +58,19 @@ Getting started (Windows)
 
 Notes for beginners
 
-- This scaffold contains working file readers for PDF and DOCX, chunking utilities, and a basic ChromaDB integration. Embeddings and text-generation calls using Google Gemini are provided as clear TODOs/stubs — you must insert your API usage details (the Google Generative AI SDK) and set your `GOOGLE_API_KEY` in `.env`.
-- The `src/` code is intentionally simple and well-commented so you can extend it to your needs.
+- The code is organized so the UI (`src/main.py`) only calls business logic in `src/ingest.py` and `src/query.py`. This makes it easier to test and modify behavior.
+- `src/config.py` centralizes configuration, logging, and prompt defaults. Edit `.env` to change behavior without modifying code.
+- The project includes safety and quality improvements:
+	- Empty documents are skipped during loading.
+	- Duplicate chunks are removed before embedding to reduce storage and redundant results.
+	- Search results can be filtered by distance (`MAX_DISTANCE`) to avoid low-quality matches.
+	- The system prompt enforces strict use of provided context and requests numeric citations.
 
-If you want, I can:
+Next steps you might want:
 
-- Implement the Gemini embedding + generation calls once you provide which Gemini model (and confirm access).
-- Add example unit tests or GitHub Actions for CI.
+- Tune `CHUNK_SIZE`, `CHUNK_OVERLAP`, and `MAX_DISTANCE` in `.env` for your documents.
+- Add unit tests that mock Gemini and Chroma to verify logic without network calls.
+- Enable CI (GitHub Actions) to run linters and tests.
+
+If you want, I can implement further improvements such as automated tests, CI, or example ingestion scripts.
 

@@ -1,26 +1,36 @@
 from dotenv import load_dotenv
 import os
+import logging
 
 load_dotenv()
 
-# Where Chroma will persist its DB files (default under project `db/`)
+# General paths and collection names
 CHROMA_DIR = os.getenv("CHROMA_DIR", "db/chroma")
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "document_qa")
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "document_knowledge_base")
+
+# Google API key for Gemini
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-def get_embedding(text: str) -> list:
-    """Return an embedding vector for `text`.
+# Ingestion chunking defaults
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-    TODO: implement this using Google Gemini / Generative AI embeddings.
-    The project intentionally leaves this as a stub so you can plug
-    in the correct model name and API usage for your account.
-    """
-    raise NotImplementedError("Implement get_embedding(text) using Google Gemini embeddings and set GOOGLE_API_KEY in .env")
+# Similarity / distance filtering
+# If Chroma returns distances, only accept results with distance <= MAX_DISTANCE.
+# Default tuned for cosine distance-like outputs; adjust if your backend uses other metrics.
+MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "0.5"))
 
-def generate_answer(prompt: str, context: str) -> str:
-    """Generate an answer using Google Gemini.
+# Logging configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL))
+logger = logging.getLogger("document_qa")
 
-    TODO: implement the call to the Gemini text generation API and
-    return the model's answer string.
-    """
-    raise NotImplementedError("Implement generate_answer(prompt, context) using Google Gemini text generation API")
+# Prompt engineering defaults
+SYSTEM_PROMPT = (
+    "You are a helpful assistant that answers questions strictly using the provided context.\n"
+    "Rules:\n"
+    "- Use ONLY the provided context blocks. Do not use external knowledge.\n"
+    "- If the information is not present, reply exactly: 'I cannot find the answer in the provided documents.'\n"
+    "- Keep answers concise and include inline citation markers like [1], [2] that refer to the provided sources.\n"
+)
+

@@ -12,12 +12,13 @@ from chromadb.config import Settings
 import google.generativeai as genai
 from tqdm import tqdm
 
-from src.config import CHROMA_DIR, CHROMA_COLLECTION, GOOGLE_API_KEY
+from src import config as cfg
 
-logger = logging.getLogger(__name__)
-if not logging.getLogger().handlers:
-    # Basic configuration for users who haven't configured logging
-    logging.basicConfig(level=logging.INFO)
+CHROMA_DIR = cfg.CHROMA_DIR
+CHROMA_COLLECTION = cfg.CHROMA_COLLECTION
+GOOGLE_API_KEY = cfg.GOOGLE_API_KEY
+
+logger = cfg.logger
 
 
 def extract_pdf_pages(path: str) -> List[Dict[str, Any]]:
@@ -109,8 +110,13 @@ def load_documents(data_dir: str = "data") -> List[Dict[str, Any]]:
         except Exception as e:
             logger.exception("Error processing file %s: %s", file, e)
 
-    logger.info("Loaded %d document items from %s", len(documents), data_dir)
-    return documents
+    # Remove empty documents (safety check)
+    non_empty = [d for d in documents if d.get("text") and d.get("text").strip()]
+    if len(non_empty) < len(documents):
+        logger.info("Dropped %d empty document items", len(documents) - len(non_empty))
+
+    logger.info("Loaded %d document items from %s", len(non_empty), data_dir)
+    return non_empty
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -304,7 +310,7 @@ def save_to_vector_db(ids: List[str], documents: List[str], metadatas: List[dict
 
 
 def run_ingest(data_dir: str = "data", collection_name: str = "document_knowledge_base",
-               persist_directory: str = "db", chunk_size: int = 1000, chunk_overlap: int = 200) -> int:
+               persist_directory: str = "db", chunk_size: int | None = None, chunk_overlap: int | None = None) -> int:
     """Main ingestion flow.
 
     Steps:
@@ -323,7 +329,12 @@ def run_ingest(data_dir: str = "data", collection_name: str = "document_knowledg
         logger.warning("No documents found in %s", data_dir)
         return 0
 
-    # 2) Chunk pages
+    # 2) Chunk pages (use defaults from config when not provided)
+    if chunk_size is None:
+        chunk_size = cfg.CHUNK_SIZE
+    if chunk_overlap is None:
+        chunk_overlap = cfg.CHUNK_OVERLAP
+
     chunks = chunk_extracted_pages(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     if not chunks:
         logger.warning("No chunks produced from documents")
@@ -335,7 +346,22 @@ def run_ingest(data_dir: str = "data", collection_name: str = "document_knowledg
     metas = []
     embs = []
 
-    for i, chunk in enumerate(tqdm(chunks, desc="Embedding chunks")):
+    # Remove duplicate chunks by exact text match (keeps first occurrence)
+    seen_texts = set()
+    unique_chunks = []
+    for c in chunks:
+        t = c.get("text", "")
+        key = t.strip()
+        if not key:
+            continue
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        unique_chunks.append(c)
+
+    logger.info("Reduced %d chunks to %d unique chunks after deduplication", len(chunks), len(unique_chunks))
+
+    for i, chunk in enumerate(tqdm(unique_chunks, desc="Embedding chunks")):
         text = chunk.get("text", "")
         metadata = chunk.get("metadata", {})
         unique_id = f"{metadata.get('source','unknown')}-{metadata.get('page',1)}-{metadata.get('chunk_range','0')}-{i}"
