@@ -9,7 +9,10 @@ from docx import Document
 import chromadb
 from chromadb.config import Settings
 
-from src.config import CHROMA_DIR, CHROMA_COLLECTION, get_embedding
+import google.generativeai as genai
+from tqdm import tqdm
+
+from src.config import CHROMA_DIR, CHROMA_COLLECTION, GOOGLE_API_KEY
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -224,9 +227,132 @@ def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
         ids.append(cid)
         documents.append(chunk)
         metadatas.append({"source": str(p), "chunk": i})
-        # get_embedding is a stub in `src.config` — implement it using Gemini embeddings
-        emb = get_embedding(chunk)
+        # Generate embedding using Gemini
+        emb = _generate_embedding(chunk)
         embeddings.append(emb)
 
     collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+    return len(ids)
+
+
+def _ensure_genai_configured():
+    """Configure the google.generativeai client if not already configured."""
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        logger.exception("Failed to configure Google Generative AI client: %s", e)
+
+
+def _generate_embedding(text: str) -> List[float]:
+    """Generate an embedding vector for `text` using Gemini `text-embedding-004`.
+
+    Returns a list of floats. Defensive parsing handles a few SDK response shapes.
+    """
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
+
+    _ensure_genai_configured()
+    try:
+        resp = genai.embeddings.create(model="text-embedding-004", input=text)
+    except Exception as e:
+        logger.exception("Embedding request failed: %s", e)
+        raise
+
+    # Parse embedding from common response shapes
+    embedding = None
+    try:
+        embedding = resp.data[0].embedding  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            embedding = resp["data"][0]["embedding"]
+        except Exception:
+            try:
+                embedding = resp["embedding"]
+            except Exception:
+                logger.error("Unable to parse embedding response: %s", resp)
+                raise RuntimeError("Unexpected embedding response shape")
+
+    return embedding
+
+
+def save_to_vector_db(ids: List[str], documents: List[str], metadatas: List[dict], embeddings: List[List[float]],
+                      collection_name: str = "document_knowledge_base", persist_directory: str = "db") -> None:
+    """Save vectors + metadata to a persistent ChromaDB collection.
+
+    Attempts to use `chromadb.PersistentClient` when present; otherwise falls
+    back to `chromadb.Client(Settings(...))`. Stores vectors under
+    `persist_directory` (defaults to `db/`).
+    """
+    client = None
+    try:
+        PersistentClient = getattr(chromadb, "PersistentClient", None)
+        if PersistentClient:
+            client = PersistentClient(persist_directory=persist_directory)
+        else:
+            raise AttributeError("PersistentClient not found")
+    except Exception:
+        logger.info("PersistentClient not available, falling back to Client with Settings")
+        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
+
+    try:
+        collection = client.get_or_create_collection(collection_name)
+        collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+        logger.info("Stored %d vectors in collection '%s'", len(ids), collection_name)
+    except Exception as e:
+        logger.exception("Failed to save vectors to ChromaDB: %s", e)
+        raise
+
+
+def run_ingest(data_dir: str = "data", collection_name: str = "document_knowledge_base",
+               persist_directory: str = "db", chunk_size: int = 1000, chunk_overlap: int = 200) -> int:
+    """Main ingestion flow.
+
+    Steps:
+    1. Load documents from `data_dir` using `load_documents()` (page-level items).
+    2. Chunk documents using `chunk_extracted_pages()` preserving metadata.
+    3. Generate embeddings for each chunk using Gemini `text-embedding-004` (with `tqdm`).
+    4. Store ids, documents, metadatas, and embeddings in a persistent ChromaDB collection.
+
+    Returns the number of vectors stored.
+    """
+    logger.info("Starting ingestion: data_dir=%s, collection=%s", data_dir, collection_name)
+
+    # 1) Load page-level documents
+    pages = load_documents(data_dir)
+    if not pages:
+        logger.warning("No documents found in %s", data_dir)
+        return 0
+
+    # 2) Chunk pages
+    chunks = chunk_extracted_pages(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    if not chunks:
+        logger.warning("No chunks produced from documents")
+        return 0
+
+    # 3) Generate embeddings with progress bar
+    ids = []
+    docs = []
+    metas = []
+    embs = []
+
+    for i, chunk in enumerate(tqdm(chunks, desc="Embedding chunks")):
+        text = chunk.get("text", "")
+        metadata = chunk.get("metadata", {})
+        unique_id = f"{metadata.get('source','unknown')}-{metadata.get('page',1)}-{metadata.get('chunk_range','0')}-{i}"
+        try:
+            embedding = _generate_embedding(text)
+        except Exception:
+            logger.exception("Skipping chunk due to embedding error: %s", unique_id)
+            continue
+
+        ids.append(unique_id)
+        docs.append(text)
+        metas.append(metadata)
+        embs.append(embedding)
+
+    # 4) Save to ChromaDB
+    save_to_vector_db(ids=ids, documents=docs, metadatas=metas, embeddings=embs,
+                      collection_name=collection_name, persist_directory=persist_directory)
+
+    logger.info("Ingestion complete: stored %d vectors", len(ids))
     return len(ids)
