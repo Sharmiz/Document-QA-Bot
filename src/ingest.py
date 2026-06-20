@@ -124,6 +124,71 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return chunks
 
 
+def chunk_extracted_pages(pages: List[Dict[str, Any]], chunk_size: int = 1000, chunk_overlap: int = 200) -> List[Dict[str, Any]]:
+    """Chunk a list of extracted pages while preserving metadata.
+
+    Input `pages` should be a list of items like:
+      {"text": "...", "metadata": {"source": "file.pdf", "page": 3}}
+
+    Output is a flat list of chunks with the shape:
+      {"text": "...", "metadata": {"source": "file.pdf", "page": 3, "chunk_range": "0-1000"}}
+
+    Parameters:
+    - chunk_size: target size in characters for each chunk.
+    - chunk_overlap: how many characters to overlap between consecutive chunks.
+
+    Overlap explanation: with `chunk_size=1000` and `chunk_overlap=200`, the
+    second chunk will start at character 800 (1000 - 200) of the original text,
+    so the final 200 characters of the first chunk appear at the beginning of
+    the second chunk. Overlap helps retain context across chunk boundaries,
+    which improves retrieval quality for queries that span chunk edges.
+    """
+    if not isinstance(pages, list):
+        logger.error("chunk_extracted_pages expects a list of pages")
+        return []
+
+    result: List[Dict[str, Any]] = []
+
+    for item in pages:
+        try:
+            text = item.get("text", "")
+            meta = item.get("metadata", {})
+            source = meta.get("source", "unknown")
+            page_no = meta.get("page", 1)
+
+            if not text or not text.strip():
+                logger.debug("Skipping empty text for %s page %s", source, page_no)
+                continue
+
+            text_len = len(text)
+            start = 0
+            chunk_index = 0
+            while start < text_len:
+                end = min(start + chunk_size, text_len)
+                chunk_text = text[start:end]
+                chunk_meta = {
+                    "source": source,
+                    "page": page_no,
+                    "chunk_range": f"{start}-{end}"
+                }
+                result.append({"text": chunk_text, "metadata": chunk_meta})
+
+                if end >= text_len:
+                    break
+                start = end - chunk_overlap
+                if start < 0:
+                    start = 0
+                chunk_index += 1
+
+            logger.info("Chunked %s page %s into %d chunk(s)", source, page_no, chunk_index + 1)
+        except Exception as e:
+            logger.exception("Failed to chunk page item: %s", e)
+            continue
+
+    logger.info("Produced %d total chunks from %d pages", len(result), len(pages))
+    return result
+
+
 def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
     """Extract text, chunk it, embed, and store in ChromaDB.
 
