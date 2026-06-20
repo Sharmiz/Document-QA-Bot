@@ -1,7 +1,7 @@
-import os
 import uuid
+import logging
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 
 from pypdf import PdfReader
 from docx import Document
@@ -11,19 +11,103 @@ from chromadb.config import Settings
 
 from src.config import CHROMA_DIR, CHROMA_COLLECTION, get_embedding
 
-
-def extract_text_from_pdf(path: str) -> str:
-    reader = PdfReader(path)
-    texts = []
-    for page in reader.pages:
-        texts.append(page.extract_text() or "")
-    return "\n\n".join(texts)
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    # Basic configuration for users who haven't configured logging
+    logging.basicConfig(level=logging.INFO)
 
 
-def extract_text_from_docx(path: str) -> str:
-    doc = Document(path)
-    paragraphs = [p.text for p in doc.paragraphs]
-    return "\n\n".join(paragraphs)
+def extract_pdf_pages(path: str) -> List[Dict[str, Any]]:
+    """Extract text from each page of a PDF and return a list of page documents.
+
+    Each item has the form:
+      {"text": "page text...", "metadata": {"source": "file.pdf", "page": 1}}
+
+    Errors reading a file or a page are logged and that page/file is skipped.
+    """
+    p = Path(path)
+    pages: List[Dict[str, Any]] = []
+    try:
+        reader = PdfReader(path)
+    except Exception as e:
+        logger.exception(f"Failed to open PDF {path}: {e}")
+        return pages
+
+    for i, page in enumerate(reader.pages):
+        try:
+            text = page.extract_text() or ""
+        except Exception as e:
+            logger.exception(f"Failed to extract text from page {i+1} of {path}: {e}")
+            text = ""
+
+        pages.append({"text": text, "metadata": {"source": p.name, "page": i + 1}})
+
+    logger.info(f"Extracted {len(pages)} page(s) from {p.name}")
+    return pages
+
+
+def extract_docx(path: str) -> List[Dict[str, Any]]:
+    """Extract text from a DOCX file and return a single document entry.
+
+    DOCX files don't have page boundaries in the same way PDFs do. This function
+    concatenates paragraph text and returns a single item with `page` = 1.
+    """
+    p = Path(path)
+    try:
+        doc = Document(path)
+    except Exception as e:
+        logger.exception(f"Failed to open DOCX {path}: {e}")
+        return []
+
+    try:
+        paragraphs = [para.text for para in doc.paragraphs if para.text and para.text.strip()]
+        text = "\n\n".join(paragraphs)
+    except Exception as e:
+        logger.exception(f"Failed to extract text from DOCX {path}: {e}")
+        text = ""
+
+    logger.info(f"Extracted DOCX {p.name} (chars={len(text)})")
+    return [{"text": text, "metadata": {"source": p.name, "page": 1}}]
+
+
+def load_documents(data_dir: str = "data") -> List[Dict[str, Any]]:
+    """Scan `data_dir` for supported files and return a flat list of documents.
+
+    Supported files: PDF (.pdf), Word (.docx), and plain text (.txt).
+
+    Returns a list of dicts like:
+      [ {"text":"...","metadata":{"source":"file.pdf","page":1}}, ... ]
+    """
+    base = Path(data_dir)
+    if not base.exists():
+        logger.warning("Data directory does not exist: %s", data_dir)
+        return []
+
+    documents: List[Dict[str, Any]] = []
+
+    for file in sorted(base.rglob("*")):
+        if not file.is_file():
+            continue
+
+        suffix = file.suffix.lower()
+        try:
+            if suffix == ".pdf":
+                documents.extend(extract_pdf_pages(str(file)))
+            elif suffix == ".docx":
+                documents.extend(extract_docx(str(file)))
+            elif suffix == ".txt":
+                try:
+                    text = file.read_text(encoding="utf-8")
+                except Exception:
+                    text = file.read_text(encoding="latin-1")
+                documents.append({"text": text, "metadata": {"source": file.name, "page": 1}})
+            else:
+                logger.debug("Skipping unsupported file type: %s", file)
+        except Exception as e:
+            logger.exception("Error processing file %s: %s", file, e)
+
+    logger.info("Loaded %d document items from %s", len(documents), data_dir)
+    return documents
 
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -41,17 +125,22 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
 
 
 def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
-    """Extract text, chunk it, embed, and store in ChromaDB."""
+    """Extract text, chunk it, embed, and store in ChromaDB.
+
+    This keeps backward compatibility with the original simple ingest flow.
+    """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
 
-    if p.suffix.lower() in [".pdf"]:
-        text = extract_text_from_pdf(path)
-    elif p.suffix.lower() in [".docx"]:
-        text = extract_text_from_docx(path)
+    if p.suffix.lower() == ".pdf":
+        # join all pages into one long text for chunking
+        pages = extract_pdf_pages(path)
+        text = "\n\n".join([pg.get("text", "") for pg in pages])
+    elif p.suffix.lower() == ".docx":
+        docs = extract_docx(path)
+        text = docs[0].get("text", "") if docs else ""
     else:
-        # treat as plain text
         text = p.read_text(encoding="utf-8")
 
     chunks = [c for c in chunk_text(text) if c.strip()]
@@ -75,5 +164,4 @@ def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
         embeddings.append(emb)
 
     collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
-    # persist is automatic for the chosen chroma backend when using a persistent directory
     return len(ids)
