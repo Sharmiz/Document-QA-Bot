@@ -1,5 +1,5 @@
 chromadb
-google-generativeai
+google-genai
 pypdf
 python-docx
 python-dotenv

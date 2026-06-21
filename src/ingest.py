@@ -9,10 +9,13 @@ from docx import Document
 import chromadb
 from chromadb.config import Settings
 
-import google.generativeai as genai
+from google import genai
 from tqdm import tqdm
 
-from src import config as cfg
+try:
+    from src import config as cfg
+except ImportError:
+    import config as cfg
 
 CHROMA_DIR = cfg.CHROMA_DIR
 CHROMA_COLLECTION = cfg.CHROMA_COLLECTION
@@ -218,6 +221,9 @@ def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
         text = p.read_text(encoding="utf-8")
 
     chunks = [c for c in chunk_text(text) if c.strip()]
+    if not chunks:
+        logger.warning("No text chunks produced from %s", path)
+        return 0
 
     # Initialise Chroma client (persistent directory)
     client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_DIR))
@@ -241,12 +247,17 @@ def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
     return len(ids)
 
 
-def _ensure_genai_configured():
-    """Configure the google.generativeai client if not already configured."""
-    try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-    except Exception as e:
-        logger.exception("Failed to configure Google Generative AI client: %s", e)
+_genai_client = None
+
+
+def _get_genai_client():
+    """Return a configured Google Gen AI client."""
+    global _genai_client
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=GOOGLE_API_KEY)
+    return _genai_client
 
 
 def _generate_embedding(text: str) -> List[float]:
@@ -254,12 +265,9 @@ def _generate_embedding(text: str) -> List[float]:
 
     Returns a list of floats. Defensive parsing handles a few SDK response shapes.
     """
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
-
-    _ensure_genai_configured()
+    client = _get_genai_client()
     try:
-        resp = genai.embeddings.create(model="text-embedding-004", input=text)
+        resp = client.models.embed_content(model="text-embedding-004", contents=text)
     except Exception as e:
         logger.exception("Embedding request failed: %s", e)
         raise
@@ -267,10 +275,10 @@ def _generate_embedding(text: str) -> List[float]:
     # Parse embedding from common response shapes
     embedding = None
     try:
-        embedding = resp.data[0].embedding  # type: ignore[attr-defined]
+        embedding = resp.embeddings[0].values  # type: ignore[attr-defined]
     except Exception:
         try:
-            embedding = resp["data"][0]["embedding"]
+            embedding = resp["embeddings"][0]["values"]
         except Exception:
             try:
                 embedding = resp["embedding"]

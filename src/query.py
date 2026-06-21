@@ -3,9 +3,13 @@ from typing import List, Dict, Any
 import chromadb
 from chromadb.config import Settings
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
-from src import config as cfg
+try:
+    from src import config as cfg
+except ImportError:
+    import config as cfg
 
 CHROMA_DIR = cfg.CHROMA_DIR
 CHROMA_COLLECTION = cfg.CHROMA_COLLECTION
@@ -13,40 +17,49 @@ GOOGLE_API_KEY = cfg.GOOGLE_API_KEY
 logger = cfg.logger
 
 
-def _ensure_genai_configured():
-    try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-    except Exception:
-        logger.exception("Failed to configure Google Generative AI client")
+_genai_client = None
+
+
+def _get_genai_client():
+    global _genai_client
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=GOOGLE_API_KEY)
+    return _genai_client
 
 
 def _generate_query_embedding(text: str) -> List[float]:
-    _ensure_genai_configured()
-    resp = genai.embeddings.create(model="text-embedding-004", input=text)
+    client = _get_genai_client()
+    resp = client.models.embed_content(model="text-embedding-004", contents=text)
     try:
-        return resp.data[0].embedding  # type: ignore[attr-defined]
+        return resp.embeddings[0].values  # type: ignore[attr-defined]
     except Exception:
         try:
-            return resp["data"][0]["embedding"]
+            return resp["embeddings"][0]["values"]
         except Exception:
             logger.error("Unexpected embedding response: %s", resp)
             raise
 
 
 def _call_gemini_flash(system_prompt: str, user_prompt: str, model: str = "gemini-2.5-flash") -> str:
-    _ensure_genai_configured()
+    client = _get_genai_client()
     try:
-        resp = genai.chat.create(model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
+        resp = client.models.generate_content(
+            model=model,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
+        )
     except Exception:
         logger.exception("Gemini generation failed")
         raise
 
     # Parse response text from common shapes
     try:
-        return resp.candidates[0].content  # type: ignore[attr-defined]
+        return resp.text  # type: ignore[attr-defined]
     except Exception:
         try:
-            return resp["candidates"][0]["content"]
+            return resp["text"]
         except Exception:
             try:
                 return resp["output"][0]["content"][0]["text"]
