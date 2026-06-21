@@ -1,7 +1,6 @@
 from typing import List, Dict, Any
 
 import chromadb
-from chromadb.config import Settings
 
 from google import genai
 from google.genai import types
@@ -17,21 +16,23 @@ GOOGLE_API_KEY = cfg.GOOGLE_API_KEY
 logger = cfg.logger
 
 
+def _get_chroma_client(persist_directory: str = CHROMA_DIR):
+    return chromadb.PersistentClient(path=persist_directory)
+
+
 _genai_client = None
 
 
 def _get_genai_client():
     global _genai_client
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
     if _genai_client is None:
-        _genai_client = genai.Client(api_key=GOOGLE_API_KEY)
+        _genai_client = genai.Client(api_key=cfg.require_google_api_key())
     return _genai_client
 
 
 def _generate_query_embedding(text: str) -> List[float]:
     client = _get_genai_client()
-    resp = client.models.embed_content(model="text-embedding-004", contents=text)
+    resp = client.models.embed_content(model=cfg.EMBEDDING_MODEL, contents=text)
     try:
         return resp.embeddings[0].values  # type: ignore[attr-defined]
     except Exception:
@@ -75,12 +76,12 @@ def query(question: str, collection_name: str = CHROMA_COLLECTION, k: int = 3) -
     1. Embed the question and search ChromaDB for top-k similar chunks.
     2. Extract documents and metadata and format context blocks.
     3. Build a strict system prompt forbidding hallucination and requiring use of context only.
-    4. Call Gemini 2.5 Flash to generate the answer.
+    4. Call the configured Gemini generation model to generate the answer.
 
     Returns a dict with keys: `answer` (string), `citations` (list), `raw_context` (string).
     """
     # 1) prepare client and embed question
-    client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_DIR))
+    client = _get_chroma_client(CHROMA_DIR)
     try:
         collection = client.get_collection(collection_name)
     except Exception:
@@ -167,9 +168,9 @@ def query(question: str, collection_name: str = CHROMA_COLLECTION, k: int = 3) -
 
     user_prompt = f"Question: {question}\n\nContext:\n{raw_context}\n\nAnswer using only the context above and include citation markers where appropriate."
 
-    # 5) Call Gemini 2.5 Flash
+    # 5) Call Gemini generation model
     try:
-        answer_text = _call_gemini_flash(system_prompt=system_prompt, user_prompt=user_prompt, model="gemini-2.5-flash")
+        answer_text = _call_gemini_flash(system_prompt=system_prompt, user_prompt=user_prompt, model=cfg.GENERATION_MODEL)
     except Exception:
         logger.exception("Generation failed; returning a safe fallback message")
         answer_text = "I cannot find the answer in the provided documents."

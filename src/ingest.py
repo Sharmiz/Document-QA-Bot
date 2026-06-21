@@ -7,7 +7,6 @@ from pypdf import PdfReader
 from docx import Document
 
 import chromadb
-from chromadb.config import Settings
 
 from google import genai
 from tqdm import tqdm
@@ -22,6 +21,12 @@ CHROMA_COLLECTION = cfg.CHROMA_COLLECTION
 GOOGLE_API_KEY = cfg.GOOGLE_API_KEY
 
 logger = cfg.logger
+
+
+def _get_chroma_client(persist_directory: str = CHROMA_DIR):
+    """Return a persistent Chroma client using the current Chroma API."""
+    Path(persist_directory).mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=persist_directory)
 
 
 def extract_pdf_pages(path: str) -> List[Dict[str, Any]]:
@@ -124,15 +129,22 @@ def load_documents(data_dir: str = "data") -> List[Dict[str, Any]]:
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """Simple sliding-window chunking by characters."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than 0")
+    if overlap < 0:
+        raise ValueError("overlap must be 0 or greater")
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
     chunks = []
     start = 0
     text_len = len(text)
     while start < text_len:
         end = min(start + chunk_size, text_len)
         chunks.append(text[start:end])
+        if end >= text_len:
+            break
         start = end - overlap
-        if start < 0:
-            start = 0
     return chunks
 
 
@@ -220,28 +232,26 @@ def ingest_file(path: str, collection_name: str = CHROMA_COLLECTION):
     else:
         text = p.read_text(encoding="utf-8")
 
-    chunks = [c for c in chunk_text(text) if c.strip()]
+    chunks = [c for c in chunk_text(text, chunk_size=cfg.CHUNK_SIZE, overlap=cfg.CHUNK_OVERLAP) if c.strip()]
     if not chunks:
         logger.warning("No text chunks produced from %s", path)
         return 0
 
     # Initialise Chroma client (persistent directory)
-    client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_DIR))
+    client = _get_chroma_client(CHROMA_DIR)
     collection = client.get_or_create_collection(collection_name)
 
     ids = []
     documents = []
     metadatas = []
-    embeddings = []
+
+    embeddings = _generate_embeddings(chunks)
 
     for i, chunk in enumerate(chunks):
         cid = f"{p.name}-{i}-{uuid.uuid4()}"
         ids.append(cid)
         documents.append(chunk)
         metadatas.append({"source": str(p), "chunk": i})
-        # Generate embedding using Gemini
-        emb = _generate_embedding(chunk)
-        embeddings.append(emb)
 
     collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
     return len(ids)
@@ -253,60 +263,71 @@ _genai_client = None
 def _get_genai_client():
     """Return a configured Google Gen AI client."""
     global _genai_client
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("GOOGLE_API_KEY is not set in the environment")
     if _genai_client is None:
-        _genai_client = genai.Client(api_key=GOOGLE_API_KEY)
+        _genai_client = genai.Client(api_key=cfg.require_google_api_key())
     return _genai_client
 
 
 def _generate_embedding(text: str) -> List[float]:
-    """Generate an embedding vector for `text` using Gemini `text-embedding-004`.
+    """Generate an embedding vector for `text` using the configured Gemini embedding model.
 
     Returns a list of floats. Defensive parsing handles a few SDK response shapes.
     """
+    return _generate_embeddings([text])[0]
+
+
+def _generate_embeddings(texts: List[str], batch_size: int = 32) -> List[List[float]]:
+    """Generate embeddings for multiple texts using batched Gemini requests."""
+    if not texts:
+        return []
+
     client = _get_genai_client()
-    try:
-        resp = client.models.embed_content(model="text-embedding-004", contents=text)
-    except Exception as e:
-        logger.exception("Embedding request failed: %s", e)
-        raise
+    embeddings: List[List[float]] = []
 
-    # Parse embedding from common response shapes
-    embedding = None
-    try:
-        embedding = resp.embeddings[0].values  # type: ignore[attr-defined]
-    except Exception:
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
         try:
-            embedding = resp["embeddings"][0]["values"]
-        except Exception:
-            try:
-                embedding = resp["embedding"]
-            except Exception:
-                logger.error("Unable to parse embedding response: %s", resp)
-                raise RuntimeError("Unexpected embedding response shape")
+            resp = client.models.embed_content(model=cfg.EMBEDDING_MODEL, contents=batch)
+        except Exception as e:
+            logger.exception("Embedding request failed for batch starting at %d: %s", start, e)
+            raise
 
-    return embedding
+        batch_embeddings = _parse_embedding_response(resp)
+        if len(batch_embeddings) != len(batch):
+            raise RuntimeError(
+                f"Expected {len(batch)} embeddings, got {len(batch_embeddings)} from Gemini"
+            )
+        embeddings.extend(batch_embeddings)
+
+    return embeddings
+
+
+def _parse_embedding_response(resp: Any) -> List[List[float]]:
+    """Parse embeddings from the current SDK response and a few older shapes."""
+    try:
+        return [embedding.values for embedding in resp.embeddings]  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        return [item["values"] for item in resp["embeddings"]]
+    except Exception:
+        pass
+
+    try:
+        return [resp["embedding"]]
+    except Exception:
+        logger.error("Unable to parse embedding response: %s", resp)
+        raise RuntimeError("Unexpected embedding response shape")
 
 
 def save_to_vector_db(ids: List[str], documents: List[str], metadatas: List[dict], embeddings: List[List[float]],
                       collection_name: str = "document_knowledge_base", persist_directory: str = "db") -> None:
     """Save vectors + metadata to a persistent ChromaDB collection.
 
-    Attempts to use `chromadb.PersistentClient` when present; otherwise falls
-    back to `chromadb.Client(Settings(...))`. Stores vectors under
-    `persist_directory` (defaults to `db/`).
+    Stores vectors under `persist_directory` (defaults to `db/`).
     """
-    client = None
-    try:
-        PersistentClient = getattr(chromadb, "PersistentClient", None)
-        if PersistentClient:
-            client = PersistentClient(persist_directory=persist_directory)
-        else:
-            raise AttributeError("PersistentClient not found")
-    except Exception:
-        logger.info("PersistentClient not available, falling back to Client with Settings")
-        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
+    client = _get_chroma_client(persist_directory)
 
     try:
         collection = client.get_or_create_collection(collection_name)
@@ -324,7 +345,7 @@ def run_ingest(data_dir: str = "data", collection_name: str = "document_knowledg
     Steps:
     1. Load documents from `data_dir` using `load_documents()` (page-level items).
     2. Chunk documents using `chunk_extracted_pages()` preserving metadata.
-    3. Generate embeddings for each chunk using Gemini `text-embedding-004` (with `tqdm`).
+    3. Generate embeddings for each chunk using the configured Gemini embedding model (with `tqdm`).
     4. Store ids, documents, metadatas, and embeddings in a persistent ChromaDB collection.
 
     Returns the number of vectors stored.

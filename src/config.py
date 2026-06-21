@@ -1,8 +1,31 @@
-from dotenv import load_dotenv
 import os
 import logging
+from pathlib import Path
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _load_env_file(path: Path) -> dict[str, str]:
+    """Load simple KEY=value pairs without warning on display-name labels."""
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip().strip("\"'")
+        values[name] = value
+        if name.replace("_", "").isalnum() and " " not in name:
+            os.environ.setdefault(name, value)
+    return values
+
+
+ENV_VALUES = _load_env_file(ENV_PATH)
 
 # General paths and collection names
 CHROMA_DIR = os.getenv("CHROMA_DIR", "db/chroma")
@@ -10,6 +33,34 @@ CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "document_knowledge_base")
 
 # Google API key for Gemini
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gemini-2.5-flash")
+
+
+def _looks_like_openai_key(value: str) -> bool:
+    return value.startswith(("sk-", "sk-proj-", "sk-proj_", "sk-pro-"))
+
+
+def require_google_api_key() -> str:
+    """Return a Gemini API key or raise a helpful error."""
+    api_key = GOOGLE_API_KEY
+    fallback_key = ENV_VALUES.get("Gemini API Key")
+    if fallback_key and (not api_key or _looks_like_openai_key(api_key)):
+        api_key = fallback_key
+
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set in .env")
+    if any(ch.isspace() for ch in api_key):
+        raise RuntimeError("GOOGLE_API_KEY contains whitespace. Paste the key as one continuous value.")
+    if _looks_like_openai_key(api_key):
+        raise RuntimeError(
+            "GOOGLE_API_KEY contains an OpenAI-style key. Replace it with your Google AI Studio Gemini API key."
+        )
+    if len(api_key) < 20:
+        raise RuntimeError(
+            "GOOGLE_API_KEY is too short to be a valid Gemini API key."
+        )
+    return api_key
 
 # Ingestion chunking defaults
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
